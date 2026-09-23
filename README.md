@@ -1,4 +1,4 @@
-# Team8 — 낙상 사고 감지 시스템
+# Team8 — 낙상 사고 감지 시스템 
 
 **라즈베리파이 On-Device AI 낙상 감지 (YOLO11n + YOLO11n-pose, 움직임 게이팅)**
 
