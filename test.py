@@ -5,8 +5,8 @@
   clip_..._manual.avi / _preview.avi 수동 녹화 / 전체 세션 녹화 (각각 _raw 동반)
 녹화되는 모든 영상은 두 벌로 저장됩니다 — <이름>.avi(판정 화면)와 <이름>_raw.avi(순수 캠 영상).
 _raw 쪽은 다른 판정 방식으로 같은 장면을 다시 실험할 때 그대로 넣어 쓰면 됩니다. (--no-raw로 끔)
-실행: python test_ver6.py --source 0
-영상: python test_ver6.py --source sample.avi --headless --save-preview
+실행: python test_ver7.py --source 0
+영상: python test_ver7.py --source sample.avi --headless --save-preview
 모델 경로는 --model / --pose-model로 지정 가능. 상세 내용: CHANGES_KO.md
 """
 import time
@@ -26,6 +26,7 @@ MODEL_PATH = "best_Hfall_int8.tflite"
 POSE_MODEL_PATH = "yolo11n-pose_int8.tflite"
 CONF_TH = 0.45
 IOU_TH = 0.45
+EMERGENCY_SEC = 5.0  # 낙상 확정 이후 관측된 넘어진 상태 N초
 CONFIRM_SEC = 1.0
 INFO_PAD_HEIGHT = 76
 DEBUG = False
@@ -52,6 +53,7 @@ BOX_COLOR = {
 }
 # [추가] 판정 상태별 색 — 박스·라벨·상단 글자·하단 막대가 모두 이 색을 쓴다.
 STATE_COLOR = {
+    'emergency': (0, 0, 255),
     'unknown': (160, 160, 160),          # 관측 누락/판단 보류
     'recovering': (255, 180, 0),         # 회복 자세 확인 중
     'standing': (0, 255, 0),            # 초록 (정상)
@@ -354,7 +356,15 @@ def infer_tensor(interp, inputs, outputs, bgr):
 
 class TemporalFallDetector:
     """관측 누락/회복/낙상 확정을 분리. 프레임 수 대신 영상 시각 사용."""
-    def __init__(self):
+    def __init__(self, emergency_sec=EMERGENCY_SEC):
+        if not np.isfinite(emergency_sec) or emergency_sec <= 0:
+            raise ValueError('emergency_sec must be finite and positive')
+        self.emergency_sec = float(emergency_sec)
+        self.fallen_duration = 0.0
+        self.emergency_active = False
+        self.emergency_now = False
+        self._last_fallen_t = None
+        self._last_fallen_observed = None
         self.state = 'unknown'
         self.history = deque()
         self.last_seen = None
@@ -376,6 +386,41 @@ class TemporalFallDetector:
         self.evidence_sec = 0.0
 
     def update(self, t, obs):
+        """N초는 낙상 확정 이후부터 계산. 관측 실패 시간은 합산하지 않는다.
+        긴 누락/회복 자세는 확정 전 타이머 초기화. Emergency는 회복 확정까지 유지.
+        """
+        self.emergency_now = False
+        alarm = self._update_fall(t, obs)
+        if not self.confirmed:
+            self.fallen_duration = 0.0
+            self._last_fallen_t = self._last_fallen_observed = None
+            self.emergency_active = False
+        elif obs is None:
+            self._last_fallen_t = None
+            if (self._last_fallen_observed is not None
+                    and t - self._last_fallen_observed > MAX_GAP_SEC):
+                self.fallen_duration = 0.0
+        elif self.state == 'recovering':
+            self.fallen_duration = 0.0
+            self._last_fallen_t = self._last_fallen_observed = None
+        elif self.state == 'fallen':
+            if (self._last_fallen_observed is not None
+                    and t - self._last_fallen_observed > MAX_GAP_SEC):
+                self.fallen_duration = 0.0
+                self._last_fallen_t = None
+            if self._last_fallen_t is not None:
+                self.fallen_duration += t - self._last_fallen_t
+            self._last_fallen_t = self._last_fallen_observed = t
+            if not self.emergency_active and self.fallen_duration >= self.emergency_sec - 1e-7:
+                self.emergency_active = self.emergency_now = True
+        if self.emergency_active:
+            self.reason = ('emergency - person/pose missing' if obs is None else
+                           'emergency - checking recovery' if self.state == 'recovering' else
+                           'emergency - prolonged fallen state')
+            self.state = 'emergency'
+        return alarm
+
+    def _update_fall(self, t, obs):
         while self.history and t - self.history[0][0] > HISTORY_SEC:
             self.history.popleft()
         if obs is None:
@@ -702,6 +747,24 @@ def box_iou(a, b):
     return area / max(1, (a[2]-a[0])*(a[3]-a[1]) + (b[2]-b[0])*(b[3]-b[1])-area)
 
 
+def draw_emergency_status(canvas, sm, t):
+    """기존 영상/UI에 긴급 배너와 테두리. 녹화에도 동일하게 포함."""
+    h, w = canvas.shape[:2]
+    if sm.emergency_active:
+        red = (0, 0, 230) if int(t * 2) % 2 == 0 else (0, 0, 120)
+        cv2.rectangle(canvas, (0, 0), (w-1, h-1), red, 8)
+        cv2.rectangle(canvas, (0, 0), (w-1, 72), red, -1)
+        cv2.putText(canvas, 'EMERGENCY - HELP REQUIRED', (12, 29),
+                    cv2.FONT_HERSHEY_SIMPLEX, .8, (255, 255, 255), 2)
+        detail = ('RECOVERY CHECK' if 'recovery' in sm.reason else
+                  'POSE LOST - ALERT REMAINS' if 'missing' in sm.reason else
+                  f'FALL PERSISTED >= {sm.emergency_sec:g}s')
+        cv2.putText(canvas, detail, (12, 58), cv2.FONT_HERSHEY_SIMPLEX, .6, (255, 255, 255), 2)
+    elif sm.confirmed:
+        cv2.putText(canvas, f'Emergency timer: {sm.fallen_duration:.1f}/{sm.emergency_sec:g}s',
+                    (12, 52), cv2.FONT_HERSHEY_SIMPLEX, .6, (0, 200, 255), 2)
+
+
 def main():
     global tflite, POSE_MODEL_PATH, SAVE_RAW, CLASS_NAMES, FALL_ID
     parser = argparse.ArgumentParser(description=__doc__)
@@ -713,9 +776,12 @@ def main():
     parser.add_argument('--headless', action='store_true')
     parser.add_argument('--save-preview', action='store_true', help='save full annotated video')
     parser.add_argument('--max-frames', type=int, default=0)
+    parser.add_argument('--emergency-sec', type=float, default=EMERGENCY_SEC, help='seconds of observed fallen state before Emergency')
     parser.add_argument('--no-raw', action='store_true',
                         help='순수 캠 영상(_raw) 저장을 끔 (기본은 판정 화면과 함께 저장)')
     args = parser.parse_args()
+    if not np.isfinite(args.emergency_sec) or args.emergency_sec <= 0:
+        parser.error('--emergency-sec must be finite and positive')
     SAVE_RAW = not args.no_raw
     for path in (args.model, args.pose_model):
         if not Path(path).is_file():
@@ -762,7 +828,7 @@ def main():
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     events = EventRecorder(out_dir)
-    sm = TemporalFallDetector()
+    sm = TemporalFallDetector(emergency_sec=args.emergency_sec)
     preview = PairedVideo(clip_path(out_dir, '_preview')) if args.save_preview else None
     manual = None
     log = (out_dir / 'predictions.jsonl').open('w', encoding='utf-8')
@@ -773,7 +839,7 @@ def main():
     last_valid_pose_t = None
     pose_fail_since = None   # [추가] 대상 박스에서 포즈가 안 잡히기 시작한 시각
     blocked = []             # [추가] 포즈가 안 잡혀 포기한 영역 [(box, 해제 시각)]
-    frames = alarms = 0
+    frames = alarms = emergencies = 0
     # [추가] 낙상이 확정되지 않을 때 원인을 바로 볼 수 있는 집계
     diag = dict(frames_with_detection=0, frames_with_pose=0, frames_fall_evidence=0,
                 frames_lying=0, frames_fall_and_lying=0, longest_lying_run_sec=0.0,
@@ -887,6 +953,7 @@ def main():
                                     f'fall:{fall_score:.2f} lying:{lying}')
             alarm = sm.update(t, obs)
             alarms += int(alarm)
+            emergencies += int(sm.emergency_now)
             diag['frames_with_detection'] += int(bool(detections))
             if obs is not None:
                 diag['frames_with_pose'] += 1
@@ -915,17 +982,23 @@ def main():
             cv2.putText(canvas, f'{sm.state.upper()}  t={t:.2f}s', (10, 27),
                         cv2.FONT_HERSHEY_SIMPLEX, .65, color, 2)
             draw_bar(canvas, h, w, f'{sm.state} {fps:.1f}fps',
-                     'AUTO EVENT REC' if events.active or alarm else 'AUTO READY', color, manual is not None)
-            if alarm:
+                     'EMERGENCY' if sm.emergency_active else ('AUTO EVENT REC' if events.active or alarm else 'AUTO READY'), color, manual is not None)
+            draw_emergency_status(canvas, sm, t)
+            if sm.emergency_active:
+                frozen = None  # 이전 낙상 정지 화면이 긴급 배너를 가리지 않음
+            if alarm or sm.emergency_now:
                 cv2.imwrite(str(clip_path(out_dir, ext='.jpg')), canvas)
-                frozen, freeze_until = canvas.copy(), t + FREEZE_DURATION_SEC
+                if alarm and not sm.emergency_active:
+                    frozen, freeze_until = canvas.copy(), t + FREEZE_DURATION_SEC
             # 녹화는 항상 현재 판정 화면. UI 프리즈와 추론을 분리.
-            events.update(t, canvas, original, alarm, sm.reason)
+            events.update(t, canvas, original, alarm or sm.emergency_now, sm.reason)
             if preview:
                 preview.add(t, canvas, original)
             if manual:
                 manual.add(t, canvas, original)
             log.write(json.dumps(dict(frame=frames, time=t, state=sm.state, alarm=alarm,
+                                      emergency=sm.emergency_active, emergency_now=sm.emergency_now,
+                                      fallen_duration=round(sm.fallen_duration, 3),
                                       observation=obs, detections=len(detections), reason=sm.reason, evidence_sec=round(sm.evidence_sec, 3),
                                       target_box=box if chosen is not None else None)) + '\n')
             frames += 1
@@ -954,7 +1027,7 @@ def main():
         cap.release()
         if not args.headless:
             cv2.destroyAllWindows()
-    summary = dict(frames=frames, alarms=alarms, elapsed_sec=time.monotonic()-started,
+    summary = dict(frames=frames, alarms=alarms, emergencies=emergencies, emergency_sec=args.emergency_sec, elapsed_sec=time.monotonic()-started,
                    event_videos=events.completed, source=args.source, model=args.model,
                    pose_model=args.pose_model, diagnostics=diag)
     (out_dir / 'summary.json').write_text(json.dumps(summary, indent=2), encoding='utf-8')
