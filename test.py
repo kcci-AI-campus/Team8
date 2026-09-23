@@ -5,8 +5,8 @@
   clip_..._manual.avi / _preview.avi 수동 녹화 / 전체 세션 녹화 (각각 _raw 동반)
 녹화되는 모든 영상은 두 벌로 저장됩니다 — <이름>.avi(판정 화면)와 <이름>_raw.avi(순수 캠 영상).
 _raw 쪽은 다른 판정 방식으로 같은 장면을 다시 실험할 때 그대로 넣어 쓰면 됩니다. (--no-raw로 끔)
-실행: python test_ver7.py --source 0
-영상: python test_ver7.py --source sample.avi --headless --save-preview
+실행: python test_ver8.py --source 0
+영상: python test_ver8.py --source sample.avi --headless --save-preview
 모델 경로는 --model / --pose-model로 지정 가능. 상세 내용: CHANGES_KO.md
 """
 import time
@@ -140,7 +140,7 @@ def load_pose_interpreter():
     return interp, in_d, out_d
 
 
-def estimate_pose(interp, in_d, out_d, frame, x1, y1, x2, y2):
+def _estimate_pose_single(interp, in_d, out_d, frame, x1, y1, x2, y2):
     """
     프레임에서 (x1,y1,x2,y2) 박스를 여유 있게 잘라 포즈 모델에 넣고,
     17개 키포인트를 (원본 프레임 좌표 x, y, confidence) 배열로 반환.
@@ -186,6 +186,36 @@ def estimate_pose(interp, in_d, out_d, frame, x1, y1, x2, y2):
     keypoints[:, 2] = kpts[:, 2]
 
     return keypoints
+
+
+def estimate_pose(interp, in_d, out_d, frame, x1, y1, x2, y2):
+    """옆으로 누운 자세에서 실패하면 사람 영역을 90도 회전해 재추론.
+    관절은 원본 좌표로 복원하므로 각도/누움 판정은 원래 화면 기준이다.
+    """
+    keypoints = _estimate_pose_single(interp, in_d, out_d, frame, x1, y1, x2, y2)
+    if keypoints is not None:
+        return keypoints
+    h, w = frame.shape[:2]
+    px, py = int((x2-x1)*POSE_PAD_RATIO), int((y2-y1)*POSE_PAD_RATIO)
+    ax, ay = max(0,x1-px), max(0,y1-py)
+    bx, by = min(w,x2+px), min(h,y2+py)
+    crop = frame[ay:by, ax:bx]
+    if crop.size == 0:
+        return None
+    ch, cw = crop.shape[:2]
+    choices = []
+    for direction in (cv2.ROTATE_90_CLOCKWISE, cv2.ROTATE_90_COUNTERCLOCKWISE):
+        rotated = cv2.rotate(crop, direction)
+        k = _estimate_pose_single(interp, in_d, out_d, rotated, 0, 0, ch, cw)
+        if k is None or int((k[:, 2] >= KPT_CONF_TH).sum()) < 5:
+            continue
+        u, v = k[:, 0].copy(), k[:, 1].copy()
+        if direction == cv2.ROTATE_90_CLOCKWISE:
+            k[:, 0], k[:, 1] = v + ax, ch - 1 - u + ay
+        else:
+            k[:, 0], k[:, 1] = cw - 1 - v + ax, u + ay
+        choices.append(k)
+    return max(choices, key=lambda k: float(k[:, 2].sum())) if choices else None
 
 
 def pose_search_box(keypoints, person_box, frame_shape):
@@ -428,9 +458,9 @@ class TemporalFallDetector:
             self.previous_support_t = None
             self.recover_since = None
             self.reason = 'person/pose missing - not normal'
-            if self.confirmed and self.last_seen is not None and t-self.last_seen <= MAX_GAP_SEC:
+            if self.confirmed:
                 self.state = 'fallen'
-                self.reason = 'confirmed fall - brief pose gap'
+                self.reason = 'confirmed fall - pose lost, awaiting recovery'
             elif (not self.confirmed and self.candidate_since is not None
                     and t - self.candidate_since <= CANDIDATE_HOLD_SEC):
                 self.state = 'falling_candidate'
@@ -887,7 +917,7 @@ def main():
                 cv2.rectangle(frame, (x1, y1), (x2, y2), (140, 140, 140), 1)
             pose_fallback = False
             if (chosen is None and last_valid_box is not None and last_valid_pose_t is not None
-                    and t - last_valid_pose_t <= POSE_FALLBACK_SEC):
+                    and (t - last_valid_pose_t <= POSE_FALLBACK_SEC or sm.confirmed or sm.state == 'falling_candidate')):
                 # 단기 검출 누락 때만 직전 사람 영역을 확장해 포즈 확인.
                 bx1, by1, bx2, by2 = last_valid_box
                 bw, bh = bx2 - bx1, by2 - by1
@@ -907,7 +937,8 @@ def main():
                 # 검출 박스가 있어도 포즈 실패 시 최근 관절 영역으로 한 번 재확인.
                 retried_pose = False
                 if (kpts is None and not pose_fallback and last_pose_roi is not None
-                        and last_valid_pose_t is not None and t-last_valid_pose_t <= POSE_FALLBACK_SEC):
+                        and last_valid_pose_t is not None
+                        and (t-last_valid_pose_t <= POSE_FALLBACK_SEC or sm.confirmed or sm.state == 'falling_candidate')):
                     kpts = estimate_pose(pose, pose_inputs, pose_outputs, original, *last_pose_roi)
                     retried_pose = kpts is not None
                 # [추가] 대상 박스에서 사람 포즈가 계속 안 잡히면(TV·가구 등 오검출에 고착된 경우)
@@ -984,6 +1015,9 @@ def main():
             draw_bar(canvas, h, w, f'{sm.state} {fps:.1f}fps',
                      'EMERGENCY' if sm.emergency_active else ('AUTO EVENT REC' if events.active or alarm else 'AUTO READY'), color, manual is not None)
             draw_emergency_status(canvas, sm, t)
+            if sm.confirmed and obs is None and not sm.emergency_active:
+                cv2.putText(canvas, 'POSE LOST - FALL ALERT RETAINED', (12, 78),
+                            cv2.FONT_HERSHEY_SIMPLEX, .55, (0, 0, 255), 2)
             if sm.emergency_active:
                 frozen = None  # 이전 낙상 정지 화면이 긴급 배너를 가리지 않음
             if alarm or sm.emergency_now:
