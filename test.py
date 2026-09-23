@@ -1,96 +1,47 @@
-"""
-라즈베리파이에서 실행 — 가위바위보 프로젝트(YOLO_Project.py)와 동일한 tflite_runtime 방식.
-전처리(letterbox)·후처리(박스 디코딩, NMS) 로직은 그 코드를 그대로 재사용했습니다.
-ultralytics 설치가 필요 없습니다 — 이미 검증된 환경(tflite_runtime + opencv + numpy) 그대로 씁니다.
-
-[추가: 스켈레톤(포즈) 기반 확인]
-낙상 감지 모델이 "fall"로 판단한 박스에 한해서만(연산 절약을 위해) 별도의 포즈 추정
-모델을 추가로 돌려, 어깨-엉덩이 축이 수직선과 얼마나 벌어져 있는지로 "정말 누운 자세인지"
-한 번 더 확인합니다. 최종 판정은 POSE_CONFIRM_MODE로 CNN 결과와 조합합니다.
-
-사전 준비
-  1) 이 파일과 같은 폴더에 낙상 탐지 tflite 파일을 둘 것 (예: best_int8.tflite)
-  2) [추가] 이 파일과 같은 폴더에 포즈 추정 tflite 파일을 둘 것 (예: yolo11n-pose_int8.tflite)
-     - 아직 없다면 Colab에서:
-         from ultralytics import YOLO
-         YOLO("yolo11n-pose.pt").export(format="tflite", int8=True, imgsz=POSE_IMG_SIZE)
-       COCO로 사전학습된 모델이라 낙상 데이터셋으로 재학습할 필요는 없습니다 —
-       사람 자세(키포인트)는 범용으로 잘 잡아냅니다.
-     - 처음 테스트할 때는 int8=False(float32)로 먼저 export해서 동작부터 확인하고,
-       이후 int8로 바꿔 속도를 올리는 순서를 추천합니다.
-  3) 아래 CLASS_NAMES를 Colab data.yaml의 names 순서와 반드시 맞출 것
-     (확인법: Colab에서 `print(yaml.safe_load(open('data.yaml'))['names'])`)
-     순서가 다르면 fall과 non-fall이 뒤바뀐 채로 동작합니다.
-
-실행: python3 test.py
-조작
-  [START REC] / [STOP & SAVE] 버튼 클릭  또는  r · 스페이스 키 → 녹화 시작 / 종료(자동 저장)
-  [QUIT] 버튼 클릭 또는 q 키                                    → 종료 (녹화 중이면 저장하고 종료)
-저장 위치: clips/clip_날짜_시각.avi
-  기본(RECORD_MODE="both")은 한 번 녹화에 두 파일이 만들어집니다.
-    clip_날짜_시각.avi       — 캠 영상 + 판정 결과(박스·스켈레톤·FALL 표시)
-    clip_날짜_시각_raw.avi   — 표시 없는 순수 캠 영상 (다른 방식으로 다시 실험할 때 사용)
-  재생 길이는 실제 촬영 시간과 같게 맞춰집니다 (처리 속도가 변해도 구간별로 배속되지 않음).
+"""시간 기반 낙상 판정 + 판정 화면을 포함한 전후 자동 녹화.
+녹화물은 clips 폴더에 clip_날짜_시각 이름으로 저장됩니다
+  clip_20260923_102418.avi           낙상 사건(전 3초 + 후 5초) 판정 화면
+  clip_20260923_102418_raw.avi       같은 구간의 순수 캠 영상
+  clip_..._manual.avi / _preview.avi 수동 녹화 / 전체 세션 녹화 (각각 _raw 동반)
+녹화되는 모든 영상은 두 벌로 저장됩니다 — <이름>.avi(판정 화면)와 <이름>_raw.avi(순수 캠 영상).
+_raw 쪽은 다른 판정 방식으로 같은 장면을 다시 실험할 때 그대로 넣어 쓰면 됩니다. (--no-raw로 끔)
+실행: python test_ver6.py --source 0
+영상: python test_ver6.py --source sample.avi --headless --save-preview
+모델 경로는 --model / --pose-model로 지정 가능. 상세 내용: CHANGES_KO.md
 """
 import time
 import os
 import cv2
 import numpy as np
-import tflite_runtime.interpreter as tflite
-from state_machine import FallStateMachine
+import argparse
+import json
+from pathlib import Path
+from collections import deque
 
-# ---- 설정 -------------------------------------------------
-MODEL_PATH = "best_int8.tflite"
-IMG_SIZE = 320
-CONF_TH = 0.45                    # 신뢰도 임계값
+# 추론 런타임은 main()에서 로드: 상태/녹화 테스트에는 모델이 필요 없음.
+tflite = None
+
+# ---- 설정: 시간 관련 추가 설정은 TemporalFallDetector 바로 위에 있음 ----
+MODEL_PATH = "best_Hfall_int8.tflite"
+POSE_MODEL_PATH = "yolo11n-pose_int8.tflite"
+CONF_TH = 0.45
 IOU_TH = 0.45
-CONFIRM_SEC = 1.0                 # 상태 기계: 낙상 지속 시간 (초)
-MOTION_TH = 3.0                   # [추가] 움직임 감지 임계값 (숫자가 낮을수록 민감)
-INFO_PAD_HEIGHT = 76              # [수정] 하단 정보 표시용 검은 여백 높이(px) — 버튼이 들어가서 조금 키움
-DEBUG = False                     # [추가] 진단용 로그 on/off — 프레임마다 검출/모션/포즈 정보 출력
+CONFIRM_SEC = 1.0
+INFO_PAD_HEIGHT = 76
+DEBUG = False
 WINDOW_NAME = "fall detection"
-
-# [추가] 녹화 기능 ----------------------------------------------------------
-CLIP_DIR = "clips"                # 녹화 파일 저장 폴더 (없으면 자동 생성)
-REC_FOURCC = "MJPG"               # 라즈베리파이에서 가장 무난한 조합 (MJPG + .avi)
-REC_EXT = ".avi"                  # mp4로 받고 싶으면 REC_FOURCC="mp4v", REC_EXT=".mp4"
-RECORD_MODE = "both"              # "both"   : 두 파일 동시 저장 (기본)
-                                   #            clip_....avi      = 캠 영상 + 판정 결과(박스·스켈레톤·FALL)
-                                   #            clip_..._raw.avi  = 표시 없는 순수 캠 영상 (다른 방식 실험용)
-                                   # "overlay": 판정 결과가 그려진 화면만 저장
-                                   # "clean"  : 순수 캠 영상만 저장 (이때는 파일명에 _raw를 붙이지 않음)
-REC_TARGET_FPS = 0                # 저장 파일의 fps. 0이면 자동(카메라 측정값과 REC_FPS_CAP 중 작은 값)
-REC_FPS_CAP = 15                  # 자동일 때의 상한 — 높을수록 파일이 커짐
-REC_WARMUP_FRAMES = 20            # 카메라 속도 측정에 쓸 프레임 수
-REC_MAX_FILL_SEC = 1.0            # [속도 보정] 처리가 오래 멈췄을 때 한 번에 채워 넣을 최대 길이(초)
-
-# [추가] 낙상 "순간"을 놓치지 않기 위한 기능 ----------------------
-# 트리거 조건: 한 프레임 안에서 CNN이 fall + 포즈가 누운 자세(pose_lying=True)로 둘 다 동의한 순간.
-# 상태 기계(sm)의 확정(1초 지속)을 기다리지 않는다 — 넘어지는 순간은 짧고, 넘어진 뒤 가만히
-# 있으면 움직임 필터에서 static 처리되어 확정 단계까지 도달하지 못하기 때문.
-FREEZE_ON_ALARM = True            # 낙상 순간이 포착되면 그 프레임(박스+스켈레톤 포함)으로 화면을 정지
-FREEZE_DURATION_SEC = 3.0         # 정지 상태를 유지할 시간(초)
-SAVE_ALARM_SNAPSHOT = True        # 같은 프레임을 이미지 파일로도 저장
-RESULT_DIR = "results"            # 캡처 이미지를 저장할 폴더 (없으면 자동 생성)
-CAPTURE_COOLDOWN_SEC = 5.0        # 프리즈 해제 후 이 시간 동안은 재캡처 안 함
-                                   # (아직 누워 있는 같은 낙상을 반복 캡처하는 것 방지)
-
-# [추가: 포즈] ------------------------------------------------
-POSE_MODEL_PATH = "yolo11n-pose_int8.tflite"  # 포즈 추정 모델 — 별도로 변환해서 준비 필요
-POSE_IMG_SIZE = 192               # 포즈 모델 입력 크기. 변환(export) 시 imgsz와 반드시 동일해야 함
-POSE_CONF_TH = 0.5                # 크롭 안에서 "사람"으로 인정할 신뢰도 임계값
-KPT_CONF_TH = 0.4                 # 개별 키포인트(관절점) 신뢰도 임계값 — 이보다 낮으면 안 보이는 부위로 간주
-LYING_ANGLE_TH_DEG = 55           # [지표1] 어깨-엉덩이 축(몸통)이 수직선과 이 각도 이상 벌어지면 "누움" 1표
-LEG_ANGLE_TH_DEG = 60             # [지표2] 엉덩이-발목 축(다리)이 수직선과 이 각도 이상 벌어지면 1표
-                                   #        (다리를 바닥에 뻗은 상태 — 서 있거나 의자에 앉으면 이보다 작음)
-KPT_ASPECT_TH = 1.0               # [지표3] 보이는 키포인트 전체의 가로/세로 비율이 이보다 크면 1표
-LYING_VOTE_MIN = 2                # 위 3개 지표 중 이 개수 이상이면 "누운 자세"로 판단
-POSE_PAD_RATIO = 0.15             # 박스를 크롭할 때 여유를 두는 비율 (사람이 잘리지 않도록)
-POSE_CONFIRM_MODE = "and"         # "and": 포즈가 "안 누움"으로 확인되면 CNN의 fall 판정을 취소(오탐 감소)
-                                   # "or" : CNN이 fall이 아니어도 포즈만으로 누운 자세면 fall로 승격(민감도 증가)
-                                   #        (단, 지금 구조는 fall 후보에서만 포즈를 돌리므로 or는 사실상 항상 True)
-POSE_DISAGREE_STREAK_TH = 3       # [추가] 포즈가 이만큼 연속으로 "안 누움"이어야 실제로 fall 판정을 취소
-                                   # (한 프레임 노이즈로 즉시 취소되는 걸 방지)
+REC_FOURCC = "MJPG"
+SAVE_RAW = False  # 판정 화면과 함께 순수 캠 영상(_raw)도 저장 (--no-raw로 끔)
+FREEZE_ON_ALARM = True  # 표시만 3초 고정; 추론/녹화는 계속
+FREEZE_DURATION_SEC = 3.0
+POSE_IMG_SIZE = 192  # 좌표 복원용; 실제 입력 크기는 모델 메타데이터에서 읽음
+POSE_CONF_TH = 0.5
+KPT_CONF_TH = 0.4
+LYING_ANGLE_TH_DEG = 55
+LEG_ANGLE_TH_DEG = 60
+KPT_ASPECT_TH = 1.0
+LYING_VOTE_MIN = 2
+POSE_PAD_RATIO = 0.15
 
 CLASS_NAMES = {0: "fall", 1: "non-fall"}
 FALL_ID = [k for k, v in CLASS_NAMES.items() if v == "fall"][0]
@@ -99,6 +50,15 @@ BOX_COLOR = {
     "non-fall": (0, 255, 0),   # 초록 (정상)
     "static": (128, 128, 128)  # 회색 (가만히 있는 물체/배경)
 }
+# [추가] 판정 상태별 색 — 박스·라벨·상단 글자·하단 막대가 모두 이 색을 쓴다.
+STATE_COLOR = {
+    'unknown': (160, 160, 160),          # 관측 누락/판단 보류
+    'recovering': (255, 180, 0),         # 회복 자세 확인 중
+    'standing': (0, 255, 0),            # 초록 (정상)
+    'falling_candidate': (0, 165, 255),  # 주황 (낙상 의심)
+    'fallen': (0, 0, 255),               # 빨강 (낙상 확정)
+}
+SKELETON_COLOR = (255, 255, 0)           # 청록 — 자세 정보라 판정 색과 구분
 
 # [추가: 포즈] COCO 17 키포인트 인덱스 & 스켈레톤 연결선 (시각화/각도 계산용)
 KPT = {
@@ -167,111 +127,6 @@ def draw_bar(canvas, h, w, state_line, rec_line, state_color, recording):
         cv2.circle(canvas, (w - 25, 25), 10, (0, 0, 255), -1)
 
 
-# [추가] 녹화 상태 관리 ------------------------------------------------------
-def measure_fps(cap, n):
-    """카메라가 실제로 몇 fps로 들어오는지 측정 (VideoWriter에 넣을 값)."""
-    t0 = time.time()
-    got = 0
-    for _ in range(n):
-        ok, _frame = cap.read()
-        if not ok:
-            break
-        got += 1
-    dt = time.time() - t0
-    if got == 0 or dt <= 0:
-        return 15.0
-    # 측정값이 터무니없이 크거나 작으면 저장 파일의 타임스탬프가 깨지므로 범위 제한
-    return float(np.clip(got / dt, 1.0, 60.0))
-
-
-def rec_needs_clean():
-    return RECORD_MODE in ("clean", "both")
-
-
-def rec_toggle(rec, frame_w, frame_h, fps):
-    """녹화 시작 <-> 종료(자동 저장) 토글."""
-    if rec["streams"]:
-        rec_stop(rec)
-        return
-
-    ts = time.strftime("%Y%m%d_%H%M%S")
-    if RECORD_MODE == "overlay":
-        plan = [("overlay", f"clip_{ts}{REC_EXT}")]
-    elif RECORD_MODE == "clean":
-        plan = [("clean", f"clip_{ts}{REC_EXT}")]
-    else:
-        plan = [("overlay", f"clip_{ts}{REC_EXT}"), ("clean", f"clip_{ts}_raw{REC_EXT}")]
-
-    streams = {}
-    for kind, name in plan:
-        path = os.path.join(CLIP_DIR, name)
-        writer = cv2.VideoWriter(path, cv2.VideoWriter_fourcc(*REC_FOURCC),
-                                 fps, (frame_w, frame_h))
-        if not writer.isOpened():
-            for w, _p in streams.values():
-                w.release()
-            rec["status"] = "WRITER FAILED - check REC_FOURCC/REC_EXT"
-            print(f"[rec] 저장 파일을 열지 못했습니다: {path} "
-                  f"(REC_FOURCC={REC_FOURCC}, REC_EXT={REC_EXT} 조합을 바꿔보세요)")
-            return
-        streams[kind] = (writer, path)
-        print(f"[rec] 녹화 시작({kind}): {path}")
-
-    rec.update(streams=streams, start=time.time(), frames=0, src_frames=0,
-               fps=fps, status="")
-
-
-def rec_write(rec, clean_frame, overlay_frame, count_src=True):
-    """
-    [속도 보정] 실제 처리 속도가 초당 몇 프레임이든, 저장 파일에는 '경과 시간 × 저장 fps'만큼의
-    프레임이 들어가도록 맞춘다. 처리가 느린 구간에서는 같은 프레임을 복제해 채우고,
-    프리즈처럼 프레임이 빨리 들어오는 구간에서는 버린다.
-    이렇게 해야 재생 길이가 실제 촬영 시간과 같아지고, 구간마다 배속이 달라지지 않는다.
-    """
-    if not rec["streams"]:
-        return
-    if count_src:
-        rec["src_frames"] += 1   # 실제로 처리한(추론한) 프레임 수 — 프리즈 구간은 제외
-
-    due = int((time.time() - rec["start"]) * rec["fps"]) + 1
-    n = due - rec["frames"]
-    if n <= 0:
-        return
-    n = min(n, max(1, int(rec["fps"] * REC_MAX_FILL_SEC)))
-
-    for _ in range(n):
-        for kind, (writer, _path) in rec["streams"].items():
-            writer.write(overlay_frame if kind == "overlay" else clean_frame)
-        rec["frames"] += 1
-
-
-def rec_stop(rec):
-    """녹화 종료 + 자동 저장."""
-    if not rec["streams"]:
-        return
-    duration = max(time.time() - rec["start"], 1e-6)
-    frames, src_frames = rec["frames"], rec["src_frames"]
-    paths = [p for _w, p in rec["streams"].values()]
-    for writer, _path in rec["streams"].values():
-        writer.release()
-    rec["streams"] = {}
-
-    print(f"[rec] 저장 완료 ({duration:.1f}초, {frames} 프레임 @ {rec['fps']} fps)")
-    for path in paths:
-        size_mb = os.path.getsize(path) / (1024 * 1024) if os.path.exists(path) else 0.0
-        print(f"[rec]   {path}  ({size_mb:.1f} MB)")
-    print(f"[rec]   실제 처리 속도 {src_frames / duration:.1f} fps "
-          f"— 저장 fps에 맞춰 프레임을 복제/생략해 재생 길이를 실제 시간과 맞췄습니다.")
-    rec["status"] = f"SAVED {time.strftime('%H:%M:%S')} ({frames}f)"
-
-
-def rec_line_text(rec):
-    if not rec["streams"]:
-        return rec["status"]
-    elapsed = int(time.time() - rec["start"])
-    return f"REC {elapsed // 60:02d}:{elapsed % 60:02d}   f:{rec['frames']}   {RECORD_MODE}"
-
-
 # [추가: 포즈] ---------------------------------------------------------------
 def load_pose_interpreter():
     interp = tflite.Interpreter(model_path=POSE_MODEL_PATH)
@@ -302,39 +157,18 @@ def estimate_pose(interp, in_d, out_d, frame, x1, y1, x2, y2):
     img_rgb = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
     img_resized = cv2.resize(img_rgb, (POSE_IMG_SIZE, POSE_IMG_SIZE))
 
-    in_type = in_d[0]["dtype"]
-    if in_type in (np.int8, np.uint8):
-        scale, zero_point = in_d[0]["quantization"]
-        if scale != 0:
-            img_norm = img_resized.astype(np.float32) / scale + zero_point
-        else:
-            img_norm = img_resized.astype(np.float32)
-        img = img_norm.astype(in_type)
-    else:
-        img = img_resized.astype(np.float32) / 255.0
-
-    img = np.expand_dims(img, axis=0)
-    if img.shape[-1] == 3:
-        img = np.transpose(img, (0, 3, 1, 2))
-
-    interp.set_tensor(in_d[0]["index"], img)
-    interp.invoke()
-
-    raw = interp.get_tensor(out_d[0]["index"])
-    out_type = out_d[0]["dtype"]
-    if out_type in (np.int8, np.uint8):
-        scale, zero_point = out_d[0]["quantization"]
-        if scale != 0:
-            raw = (raw.astype(np.float32) - zero_point) * scale
+    raw = infer_tensor(interp, in_d, out_d, crop)
 
     if raw.ndim == 3:
         raw = raw[0]
-    if raw.shape[0] < raw.shape[1]:
+    if raw.shape[0] == 56:
         raw = raw.transpose()   # (N, 56) = [cx,cy,w,h, person_conf, (kx,ky,kconf)*17]
 
     if raw.shape[0] == 0:
         return None
 
+    if raw.shape[1] != 56:
+        raise ValueError(f"Expected pose output (N,56), got {raw.shape}")
     person_conf = raw[:, 4]
     best_i = int(np.argmax(person_conf))
     if person_conf[best_i] < POSE_CONF_TH:
@@ -350,6 +184,18 @@ def estimate_pose(interp, in_d, out_d, frame, x1, y1, x2, y2):
     keypoints[:, 2] = kpts[:, 2]
 
     return keypoints
+
+
+def pose_search_box(keypoints, person_box, frame_shape):
+    """마지막 관절 영역을 확장. 가구까지 포함한 검출 박스보다 사람에 집중."""
+    visible = keypoints[keypoints[:, 2] >= KPT_CONF_TH]
+    if len(visible) < 5:
+        return None
+    h, w = frame_shape[:2]
+    scale = max(person_box[3] - person_box[1], 1)
+    low, high = visible[:, :2].min(axis=0), visible[:, :2].max(axis=0)
+    return (max(0, int(low[0] - scale*.35)), max(0, int(low[1] - scale*.25)),
+            min(w, int(high[0] + scale*.35)), min(h, int(high[1] + scale*.5)))
 
 
 def _kpt_center(keypoints, name_a, name_b):
@@ -412,7 +258,7 @@ def is_lying_down(keypoints):
     return bool(votes >= LYING_VOTE_MIN)
 
 
-def draw_skeleton(frame, keypoints, color=(0, 255, 255)):
+def draw_skeleton(frame, keypoints, color=SKELETON_COLOR):
     for x, y, c in keypoints:
         if c >= KPT_CONF_TH:
             cv2.circle(frame, (int(x), int(y)), 3, color, -1)
@@ -424,334 +270,696 @@ def draw_skeleton(frame, keypoints, color=(0, 255, 255)):
 # -----------------------------------------------------------------------------
 
 
+# ---- 추가: 시간 기반 판정 / 자동 사건 녹화 -------------------------------
+PRE_EVENT_SEC = 3.0
+POST_EVENT_SEC = 5.0
+HISTORY_SEC = 1.5
+DROP_RATIO = 0.18       # 이전 사람 박스 높이 대비 중심 하강량
+DROP_SPEED = 0.20       # 초당 이전 박스 높이 대비 하강량
+ANGLE_CHANGE = 20.0
+RECOVERY_SEC = 1.0
+MAX_GAP_SEC = 0.75
+EVENT_FPS = 10.0
+BUFFER_MAX_FRAMES = 90  # JPEG 압축 프레임으로 메모리 사용 제한
+# [추가] 낙상이 확정되지 않던 문제 대응 설정
+TARGET_IOU = 0.05          # 대상 추적 매칭 임계값 (넘어지면 박스 모양이 확 바뀌어 IoU가 끊김)
+REACQUIRE_DIST_RATIO = 1.2  # IoU가 끊겨도 중심이 이 비율(직전 박스 높이 대비) 안이면 같은 사람으로 이어붙임
+LYING_CONFIRM_SEC = 1.5    # 하강 순간을 놓쳤어도 '누움'이 이만큼 이어지면 낙상 확정
+LYING_GRACE_SEC = 0.6      # 누움 사이에 '안 누움/관측 실패'가 이 시간 이내면 끊긴 것으로 보지 않음
+                           # (int8 포즈가 프레임마다 흔들리고, 바닥에 있으면 가려져 키포인트가 자주 빠짐)
+CLASS_MERGE_IOU = 0.4      # 같은 사람에 fall/non-fall 박스가 겹쳐 나올 때 같은 사람으로 묶는 기준
+TARGET_STUCK_SEC = 2.0     # 대상 박스에서 포즈가 이 시간 이상 안 잡히면 대상 포기 (정지 사물 고착 방지)
+TARGET_BLOCK_SEC = 5.0     # 포기한 박스 영역은 이 시간 동안 새 대상으로 뽑지 않음
+
+# [수정] 빠른 낙상과 회복을 위한 별도 확인 조건.
+RECOVERY_ANGLE_DEG = 35.0
+DOWN_ANGLE_DEG = 50.0
+DOWN_ASPECT_RATIO = 1.0
+FAST_CONFIRM_SEC = 0.4  # 하강+자세변화가 있을 때만 사용, 관측 누락 시간 제외
+SEATED_HIP_DROP_RATIO = 0.10
+SEATED_SHOULDER_DROP_RATIO = 0.18  # 골반/어깨 동반 하강으로 허리 숙이기와 구별
+CANDIDATE_HOLD_SEC = 3.0
+POSE_FALLBACK_SEC = 2.0  # 최근 대상 영역에서 짧게 포즈 재확인
+
+
+def clip_path(directory, suffix='', ext='.avi'):
+    """clips 폴더에 clip_날짜_시각[_구분].확장자 형태의 겹치지 않는 경로를 만든다."""
+    directory = Path(directory)
+    directory.mkdir(parents=True, exist_ok=True)
+    stamp = time.strftime('%Y%m%d_%H%M%S')
+    path = directory / f'clip_{stamp}{suffix}{ext}'
+    index = 2
+    while path.exists():
+        path = directory / f'clip_{stamp}_{index}{suffix}{ext}'
+        index += 1
+    return path
+
+
+def infer_tensor(interp, inputs, outputs, bgr):
+    """모델의 NHWC/NCHW 형태, 양자화 입출력에 맞춘 전처리/후처리.
+    기존 모델과 같이 0..1 RGB 및 직접 resize를 사용한다.
+    """
+    detail = inputs[0]
+    shape = list(detail['shape'])
+    if len(shape) != 4:
+        raise ValueError(f'Unsupported input shape: {shape}')
+    if shape[-1] == 3:
+        height, width, nchw = shape[1], shape[2], False
+    elif shape[1] == 3:
+        height, width, nchw = shape[2], shape[3], True
+    else:
+        raise ValueError(f'Expected RGB input: {shape}')
+    data = cv2.resize(cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB), (width, height))
+    data = data.astype(np.float32) / 255.0
+    dtype = detail['dtype']
+    if np.issubdtype(dtype, np.integer):
+        scale, zero = detail['quantization']
+        if scale <= 0:
+            raise ValueError('Invalid input quantization scale')
+        limits = np.iinfo(dtype)
+        data = np.clip(np.rint(data / scale + zero), limits.min, limits.max)
+    data = data.astype(dtype)[None]
+    if nchw:
+        data = data.transpose(0, 3, 1, 2)
+    interp.set_tensor(detail['index'], data)
+    interp.invoke()
+    out = interp.get_tensor(outputs[0]['index'])
+    if np.issubdtype(out.dtype, np.integer):
+        scale, zero = outputs[0]['quantization']
+        if scale <= 0:
+            raise ValueError('Invalid output quantization scale')
+        out = (out.astype(np.float32) - zero) * scale
+    return out
+
+
+class TemporalFallDetector:
+    """관측 누락/회복/낙상 확정을 분리. 프레임 수 대신 영상 시각 사용."""
+    def __init__(self):
+        self.state = 'unknown'
+        self.history = deque()
+        self.last_seen = None
+        self.lying_since = None
+        self.lying_run_since = None
+        self.last_lying_t = None
+        self.recover_since = None
+        self.candidate_since = None
+        self.last_descent_t = None
+        self.evidence_sec = 0.0
+        self.previous_support_t = None
+        self.last_support_t = None
+        self.confirmed = False
+        self.reason = 'waiting for person/pose'
+
+    def _clear_evidence(self):
+        self.lying_run_since = self.last_lying_t = None
+        self.previous_support_t = self.last_support_t = None
+        self.evidence_sec = 0.0
+
+    def update(self, t, obs):
+        while self.history and t - self.history[0][0] > HISTORY_SEC:
+            self.history.popleft()
+        if obs is None:
+            # 누락 시간을 누움 지속 시간에 더하지 않는다.
+            self.previous_support_t = None
+            self.recover_since = None
+            self.reason = 'person/pose missing - not normal'
+            if self.confirmed and self.last_seen is not None and t-self.last_seen <= MAX_GAP_SEC:
+                self.state = 'fallen'
+                self.reason = 'confirmed fall - brief pose gap'
+            elif (not self.confirmed and self.candidate_since is not None
+                    and t - self.candidate_since <= CANDIDATE_HOLD_SEC):
+                self.state = 'falling_candidate'
+            else:
+                self.state = 'unknown'
+            if self.last_support_t is not None and t - self.last_support_t > LYING_GRACE_SEC:
+                self._clear_evidence()
+            return False
+
+        gap = None if self.last_seen is None else t - self.last_seen
+        self.last_seen = t
+        angle = obs['angle']
+        # fall 점수가 남더라도 신뢰되는 수직 몸통 자세면 회복 가능.
+        upright = (obs['lying'] is False and angle is not None
+                   and angle <= RECOVERY_ANGLE_DEG)
+        descent = False
+        abrupt_tilt = False
+        for old_t, old in self.history:
+            dt = t - old_t
+            drop = (obs['cy'] - old['cy']) / max(old['height'], 1)
+            angle_change = (angle is not None and old['angle'] is not None
+                            and angle - old['angle'] >= ANGLE_CHANGE)
+            shape_change = obs['aspect'] - old['aspect'] >= 0.35
+            if (angle_change and obs['fall'] and old['angle'] <= RECOVERY_ANGLE_DEG
+                    and angle >= DOWN_ANGLE_DEG):
+                abrupt_tilt = True
+            shoulder_drop = None
+            if obs.get('shoulder_y') is not None and old.get('shoulder_y') is not None:
+                shoulder_drop = (obs['shoulder_y'] - old['shoulder_y']) / max(old['height'], 1)
+            seated_drop = (drop >= SEATED_HIP_DROP_RATIO and shoulder_drop is not None
+                           and shoulder_drop >= SEATED_SHOULDER_DROP_RATIO and angle_change)
+            if (dt >= 0.08 and (drop >= DROP_RATIO or seated_drop) and drop / dt >= DROP_SPEED
+                    and (angle_change or shape_change) and old['lying'] is False
+                    and old['angle'] is not None and old['angle'] <= RECOVERY_ANGLE_DEG):
+                descent = True
+                break
+        self.history.append((t, dict(obs)))
+        if abrupt_tilt and not self.confirmed and self.candidate_since is None:
+            # 급격한 기울기는 의심만 시작. 빠른 확정에는 실제 하강도 필요.
+            self.candidate_since = t
+        if descent and not self.confirmed:
+            self.last_descent_t = t
+            if self.candidate_since is None:
+                self.candidate_since = t
+            self.state = 'falling_candidate'
+            self.reason = 'descent + posture change'
+        recent_descent = (self.last_descent_t is not None
+                          and t - self.last_descent_t <= CANDIDATE_HOLD_SEC)
+        # 하강을 실제 관측한 경우에만 다리가 굽혀진 낙상 자세도 확인에 사용.
+        down_pose = (obs['lying'] is True or
+                     (angle is not None and angle >= DOWN_ANGLE_DEG
+                      and obs.get('pose_aspect', 0) >= DOWN_ASPECT_RATIO))
+        support = bool(down_pose and (obs['fall'] or recent_descent) and not upright)
+        if support:
+            if self.last_support_t is None or t - self.last_support_t > LYING_GRACE_SEC:
+                self._clear_evidence()
+            if self.lying_run_since is None:
+                self.lying_run_since = t
+            # 긴 누락/안 누움 구간은 경과 초에서 제외. 연속 관측 구간만 적립.
+            if self.previous_support_t is not None:
+                dt = t - self.previous_support_t
+                if dt <= MAX_GAP_SEC:
+                    self.evidence_sec += dt
+            self.previous_support_t = self.last_support_t = self.last_lying_t = t
+        else:
+            self.previous_support_t = None
+            if upright or self.last_support_t is None or t - self.last_support_t > LYING_GRACE_SEC:
+                self._clear_evidence()
+
+        if self.confirmed:
+            if upright:
+                if self.recover_since is None or (gap is not None and gap > MAX_GAP_SEC):
+                    self.recover_since = t
+                self.state = 'recovering'
+                self.reason = 'upright pose - confirming recovery'
+                if t - self.recover_since >= RECOVERY_SEC - 1e-7:
+                    self.confirmed = False
+                    self.state = 'standing'
+                    self.reason = 'recovered by upright pose'
+                    self.history.clear()
+                    self._clear_evidence()
+                    self.candidate_since = self.last_descent_t = None
+                    self.recover_since = None
+            else:
+                self.recover_since = None
+                self.state = 'fallen'
+                self.reason = 'confirmed fall - awaiting recovery'
+            return False
+
+        required = FAST_CONFIRM_SEC if recent_descent else LYING_CONFIRM_SEC
+        if support and self.evidence_sec >= required - 1e-7:
+            self.confirmed = True
+            self.state = 'fallen'
+            self.recover_since = None
+            self.reason = 'descent + observed down posture' if recent_descent else 'sustained lying'
+            return True
+        if upright:
+            self.state = 'standing'
+            self.candidate_since = self.last_descent_t = None
+            self.reason = 'upright pose'
+        elif (support or recent_descent or
+              (self.candidate_since is not None and t - self.candidate_since <= CANDIDATE_HOLD_SEC)):
+            self.state = 'falling_candidate'
+            self.reason = 'checking down posture'
+        else:
+            self.state = 'unknown'
+            self.candidate_since = None
+            self.reason = 'posture uncertain'
+        return False
+
+class TimedVideo:
+    """관측 시각을 고정 FPS 영상으로 변환. 빈 구간은 직전 프레임 유지."""
+    def __init__(self, path, fps=EVENT_FPS):
+        self.path, self.fps = str(path), fps
+        self.writer = None
+        self.previous = None
+        self.start = self.last = self.next_tick = None
+        self.count = 0
+
+    def add(self, t, frame):
+        if self.writer is None:
+            h, w = frame.shape[:2]
+            self.writer = cv2.VideoWriter(self.path, cv2.VideoWriter_fourcc(*REC_FOURCC), self.fps, (w, h))
+            if not self.writer.isOpened():
+                raise RuntimeError(f'Cannot open video writer: {self.path}')
+            self.start = self.next_tick = t
+        if self.previous is not None:
+            while self.next_tick < t - 1e-7:
+                self.writer.write(self.previous)
+                self.count += 1
+                self.next_tick += 1 / self.fps
+        self.previous = frame.copy()
+        self.last = t
+
+    def close(self):
+        if self.writer is not None:
+            self.writer.write(self.previous)
+            self.count += 1
+            self.writer.release()
+            self.writer = None
+            print(f'[video] {self.path} ({self.count} frames)')
+
+
+class PairedVideo:
+    """같은 시간축으로 두 영상을 함께 저장.
+      <name>.avi      — 판정 화면(박스·스켈레톤·상태 표시 포함)
+      <name>_raw.avi  — 표시 없는 순수 캠 영상 (다른 방식으로 다시 실험할 때 사용)
+    TimedVideo를 두 개 들고 있을 뿐이라 프레임 시각 처리는 기존과 동일하다.
+    """
+    def __init__(self, path, fps=EVENT_FPS, save_raw=None):
+        path = Path(path)
+        self.overlay = TimedVideo(path, fps)
+        keep_raw = SAVE_RAW if save_raw is None else save_raw
+        self.raw = TimedVideo(path.with_name(path.stem + '_raw' + path.suffix), fps) if keep_raw else None
+
+    def add(self, t, canvas, original=None):
+        self.overlay.add(t, canvas)
+        if self.raw is not None and original is not None:
+            self.raw.add(t, original)
+
+    def close(self):
+        self.overlay.close()
+        if self.raw is not None:
+            self.raw.close()
+
+    # EventRecorder가 TimedVideo처럼 다룰 수 있도록 속성 위임
+    @property
+    def path(self):
+        return self.overlay.path
+
+    @property
+    def raw_path(self):
+        return self.raw.path if self.raw is not None else None
+
+    @property
+    def previous(self):
+        return self.overlay.previous
+
+    @property
+    def raw_previous(self):
+        return self.raw.previous if self.raw is not None else None
+
+    @property
+    def start(self):
+        return self.overlay.start
+
+    @property
+    def last(self):
+        return self.overlay.last
+
+
+class EventRecorder:
+    def __init__(self, directory):
+        self.directory = Path(directory)
+        self.directory.mkdir(parents=True, exist_ok=True)
+        self.buffer = deque(maxlen=BUFFER_MAX_FRAMES)
+        self.active = None
+        self.deadline = None
+        self.metadata = None
+        self.completed = []
+        self.last_buffer_time = None
+
+    def update(self, t, canvas, original=None, alarm=False, reason=''):
+        # 사건 이후 5초가 지난 첫 프레임은 종료 경계까지만 이전 화면으로 채움.
+        if self.active is not None and t > self.deadline:
+            self.active.add(self.deadline, self.active.previous, self.active.raw_previous)
+            self.finish(False)
+        if self.last_buffer_time is None or t - self.last_buffer_time >= 1 / EVENT_FPS - 1e-7 or alarm:
+            ok, encoded = cv2.imencode('.jpg', canvas, [cv2.IMWRITE_JPEG_QUALITY, 85])
+            if not ok:
+                raise RuntimeError('Cannot encode pre-event frame')
+            encoded_raw = None
+            if SAVE_RAW and original is not None:
+                ok_raw, encoded_raw = cv2.imencode('.jpg', original, [cv2.IMWRITE_JPEG_QUALITY, 85])
+                if not ok_raw:
+                    raise RuntimeError('Cannot encode pre-event raw frame')
+            self.buffer.append((t, encoded, encoded_raw))
+            self.last_buffer_time = t
+        # 경계 직전 프레임 하나를 유지해 가능한 경우 정확히 3초부터 시작.
+        while len(self.buffer) > 1 and self.buffer[1][0] <= t - PRE_EVENT_SEC:
+            self.buffer.popleft()
+        if alarm:
+            if self.active is None:
+                self.active = PairedVideo(clip_path(self.directory))
+                begin = max(t - PRE_EVENT_SEC, self.buffer[0][0])
+                self.metadata = {'trigger_time': t, 'start_time': begin, 'reason': reason,
+                                 'overlay': True, 'raw_path': self.active.raw_path,
+                                 'requested_pre_sec': PRE_EVENT_SEC,
+                                 'requested_post_sec': POST_EVENT_SEC, 'triggers': [t]}
+                for stamp, jpg, jpg_raw in self.buffer:
+                    self.active.add(max(stamp, begin), cv2.imdecode(jpg, cv2.IMREAD_COLOR),
+                                    cv2.imdecode(jpg_raw, cv2.IMREAD_COLOR) if jpg_raw is not None else None)
+            else:
+                self.metadata['triggers'].append(t)
+                self.active.add(t, canvas, original)
+            self.deadline = t + POST_EVENT_SEC
+        elif self.active is not None:
+            self.active.add(t, canvas, original)
+        if self.active is not None and t >= self.deadline:
+            self.finish(False)
+
+    def finish(self, interrupted=True):
+        if self.active is None:
+            return
+        video = self.active
+        self.metadata.update(end_time=video.last, interrupted=interrupted,
+                             actual_pre_sec=self.metadata['trigger_time'] - video.start,
+                             actual_post_sec=video.last - self.metadata['triggers'][-1])
+        video.close()
+        Path(video.path).with_suffix('.json').write_text(json.dumps(self.metadata, indent=2), encoding='utf-8')
+        self.completed.append(video.path)
+        if video.raw_path:
+            self.completed.append(video.raw_path)
+        self.active = None
+
+
+def detect_people(interp, inputs, outputs, frame):
+    raw = infer_tensor(interp, inputs, outputs, frame)[0]
+    if raw.shape[0] == 4 + len(CLASS_NAMES):
+        raw = raw.T
+    if raw.ndim != 2 or raw.shape[1] != 4 + len(CLASS_NAMES):
+        raise ValueError(f'Expected YOLO detection output with 6 fields: {raw.shape}')
+    scores = raw[:, 4:].max(axis=1)
+    ids = raw[:, 4:].argmax(axis=1)
+    raw, scores, ids = raw[scores > CONF_TH], scores[scores > CONF_TH], ids[scores > CONF_TH]
+    h, w = frame.shape[:2]
+    boxes = [[float((r[0]-r[2]/2)*w), float((r[1]-r[3]/2)*h),
+              float(r[2]*w), float(r[3]*h)] for r in raw]
+    # 두 클래스 모두 사람: 클래스 간 중복 박스도 제거.
+    keep = cv2.dnn.NMSBoxes(boxes, scores.tolist(), CONF_TH, IOU_TH)
+    xyxy = np.array([[b[0], b[1], b[0]+b[2], b[1]+b[3]] for b in boxes], dtype=np.float32) \
+        if boxes else np.zeros((0, 4), np.float32)
+    result = []
+    for i in np.asarray(keep).reshape(-1):
+        x, y, bw, bh = boxes[i]
+        box = (max(0, int(x)), max(0, int(y)), min(w, int(x+bw)), min(h, int(y+bh)))
+        if box[2] <= box[0] or box[3] <= box[1]:
+            continue
+        # [수정] 클래스 무관 NMS는 한 사람에 fall/non-fall 박스가 겹쳐 나올 때 점수 높은 쪽만 남긴다.
+        # 그 바람에 fall 근거가 통째로 사라져 낙상이 확정되지 않았다.
+        # 이 박스와 겹치는 후보들 중 fall 클래스의 최고 점수를 따로 구해 함께 넘긴다.
+        fall_score = 0.0
+        if len(xyxy):
+            ax1, ay1, ax2, ay2 = xyxy[i]
+            ix1 = np.maximum(ax1, xyxy[:, 0]); iy1 = np.maximum(ay1, xyxy[:, 1])
+            ix2 = np.minimum(ax2, xyxy[:, 2]); iy2 = np.minimum(ay2, xyxy[:, 3])
+            inter = np.clip(ix2-ix1, 0, None) * np.clip(iy2-iy1, 0, None)
+            area_a = max((ax2-ax1) * (ay2-ay1), 1e-6)
+            area_b = (xyxy[:, 2]-xyxy[:, 0]) * (xyxy[:, 3]-xyxy[:, 1])
+            overlap = inter / np.maximum(area_a + area_b - inter, 1e-6)
+            same = (overlap >= CLASS_MERGE_IOU) & (ids == FALL_ID)
+            if same.any():
+                fall_score = float(scores[same].max())
+        result.append((box, float(scores[i]), int(ids[i]), fall_score))
+    return result
+
+
+def box_center(box):
+    return ((box[0] + box[2]) / 2, (box[1] + box[3]) / 2)
+
+
+def box_center_dist(a, b):
+    (ax, ay), (bx, by) = box_center(a), box_center(b)
+    return ((ax - bx) ** 2 + (ay - by) ** 2) ** 0.5
+
+
+def is_blocked(box, blocked, t):
+    """포즈가 잡히지 않아 포기한 영역인지 (정지 사물에 대상이 고착되는 것 방지)."""
+    return any(until > t and box_iou(box, region) >= 0.5 for region, until in blocked)
+
+
+def box_iou(a, b):
+    area = max(0, min(a[2], b[2])-max(a[0], b[0])) * max(0, min(a[3], b[3])-max(a[1], b[1]))
+    return area / max(1, (a[2]-a[0])*(a[3]-a[1]) + (b[2]-b[0])*(b[3]-b[1])-area)
+
+
 def main():
-    interpreter = tflite.Interpreter(model_path=MODEL_PATH)
+    global tflite, POSE_MODEL_PATH, SAVE_RAW, CLASS_NAMES, FALL_ID
+    parser = argparse.ArgumentParser(description=__doc__)
+    base = Path(__file__).resolve().parent
+    parser.add_argument('--source', default='0', help='camera index or video path')
+    parser.add_argument('--model', default=str(base / MODEL_PATH))
+    parser.add_argument('--pose-model', default=str(base / POSE_MODEL_PATH))
+    parser.add_argument('--output-dir', default=str(base / 'clips'))
+    parser.add_argument('--headless', action='store_true')
+    parser.add_argument('--save-preview', action='store_true', help='save full annotated video')
+    parser.add_argument('--max-frames', type=int, default=0)
+    parser.add_argument('--no-raw', action='store_true',
+                        help='순수 캠 영상(_raw) 저장을 끔 (기본은 판정 화면과 함께 저장)')
+    args = parser.parse_args()
+    SAVE_RAW = not args.no_raw
+    for path in (args.model, args.pose_model):
+        if not Path(path).is_file():
+            parser.error(f'Model file missing: {path}')
+    try:
+        import tflite_runtime.interpreter as tflite
+    except ImportError:
+        try:
+            import ai_edge_litert.interpreter as tflite
+        except ImportError:
+            import tensorflow as tf
+            tflite = tf.lite
+    # 이름이 같은 다른 모델을 실수로 사용하는 경우 안내 (클래스 수가 같으면 경고만 하고 계속 진행).
+    import zipfile
+    if zipfile.is_zipfile(args.model):
+        with zipfile.ZipFile(args.model) as archive:
+            if 'metadata.json' in archive.namelist():
+                metadata = json.loads(archive.read('metadata.json'))
+                names = metadata.get('names')
+                expected = {str(k): v for k, v in CLASS_NAMES.items()}
+                if names is not None:
+                    actual = {int(k): v for k, v in names.items()}
+                    normalized = {k: v.lower().replace('_', '-').strip() for k, v in actual.items()}
+                    fall_ids = [k for k, v in normalized.items() if v in ('fall', 'fall-detected')]
+                    others = [v for k, v in normalized.items() if k not in fall_ids]
+                    if len(actual) != 2 or len(fall_ids) != 1 or any(v not in ('person', 'non-fall') for v in others):
+                        parser.error(f'Unsupported model classes: {actual}')
+                    CLASS_NAMES, FALL_ID = actual, fall_ids[0]
+    interpreter = tflite.Interpreter(model_path=args.model)
     interpreter.allocate_tensors()
-    input_details = interpreter.get_input_details()
-    output_details = interpreter.get_output_details()
-
-    input_index = input_details[0]["index"]
-    output_index = output_details[0]["index"]
-    input_type = input_details[0]["dtype"]
-    input_scale_zero = input_details[0]["quantization"]
-    print("[fall-model] input :", input_details)   # [추가] DEBUG 여부와 무관하게 시작 시 한 번만 출력
-    print("[fall-model] output:", output_details)
-
-    # [추가: 포즈] 포즈 추정 모델도 함께 로드
-    pose_interp, pose_in_d, pose_out_d = load_pose_interpreter()
-
-    # [추가] 캡처 저장 폴더 준비
-    os.makedirs(RESULT_DIR, exist_ok=True)
-    os.makedirs(CLIP_DIR, exist_ok=True)   # [추가] 녹화 파일 폴더
-
-    sm = FallStateMachine(confirm_sec=CONFIRM_SEC)
-    cap = cv2.VideoCapture(0)
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-
+    inputs, outputs = interpreter.get_input_details(), interpreter.get_output_details()
+    POSE_MODEL_PATH = args.pose_model
+    pose, pose_inputs, pose_outputs = load_pose_interpreter()
+    print('[fall-model]', inputs, outputs)
+    is_camera = args.source.isdecimal()
+    cap = cv2.VideoCapture(int(args.source) if is_camera else args.source)
+    # cap = cv2.VideoCapture('./clips/test.avi')
     if not cap.isOpened():
-        raise SystemExit("카메라를 열 수 없습니다.")
-
-    # [추가] 녹화 준비 — 버튼 클릭을 받기 위해 창을 먼저 만들고 마우스 콜백 등록
-    cam_fps = round(measure_fps(cap, REC_WARMUP_FRAMES), 1)
-    rec_fps = REC_TARGET_FPS if REC_TARGET_FPS > 0 else min(cam_fps, REC_FPS_CAP)
-    print(f"[rec] 카메라 속도 {cam_fps} fps / 저장 fps {rec_fps} / 모드 {RECORD_MODE}")
-    cv2.namedWindow(WINDOW_NAME)
-    cv2.setMouseCallback(WINDOW_NAME, on_mouse)
-    rec = {"streams": {}, "start": 0.0, "frames": 0, "src_frames": 0, "fps": rec_fps,
-           "status": "READY - press START REC"}
-
-    prev_t = time.time()
-    prev_gray = None  # 움직임 비교를 위한 이전 프레임 저장용
-    frame_w_last, frame_h_last = 640, 480  # [추가] 프리즈 중 녹화 시작에 대비한 마지막 프레임 크기
-
-    # [추가] 프리즈(화면 정지) 상태 관리용 변수
-    frozen_canvas = None
-    freeze_until = 0.0
-    capture_cooldown_until = 0.0  # [추가] 이 시각 전까지는 재캡처 금지
-    pose_disagree_streak = 0  # [추가] 포즈가 연속으로 "안 누움"이라고 판단한 횟수 (노이즈 완충용)
-
-    while cap.isOpened():
-        loop_now = time.time()
-
-        # ---- [추가] 프리즈 중이면 정지 화면만 계속 보여주고 새 프레임 처리는 건너뜀 ----
-        if frozen_canvas is not None:
-            if loop_now < freeze_until:
-                # [추가] 화면은 멈춰 있어도 녹화는 계속 — 넘어진 직후 구간이 클립에서 빠지지 않도록.
-                # overlay 스트림에는 화면에 보이는 정지 화면을, clean 스트림에는 실시간 프레임을 기록.
-                if rec["streams"]:
-                    frozen_view = frozen_canvas[:frozen_canvas.shape[0] - INFO_PAD_HEIGHT]
-                    live = None
-                    if rec_needs_clean():
-                        ok_rec, live = cap.read()
-                        if not ok_rec:
-                            live = None
-                    rec_write(rec, live if live is not None else frozen_view, frozen_view,
-                              count_src=False)
-
-                disp = frozen_canvas.copy()   # 정지 화면 위에 막대만 최신 상태로 다시 그림
-                draw_bar(disp, disp.shape[0] - INFO_PAD_HEIGHT, disp.shape[1],
-                         "FROZEN", rec_line_text(rec), (0, 0, 255), bool(rec["streams"]))
-                cv2.imshow(WINDOW_NAME, disp)
-
+        raise RuntimeError(f'Cannot open source: {args.source}')
+    source_fps = cap.get(cv2.CAP_PROP_FPS)
+    if not is_camera and (not np.isfinite(source_fps) or source_fps <= 0):
+        cap.release()
+        raise RuntimeError('Video FPS missing; cannot construct reliable timestamps')
+    out_dir = Path(args.output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    events = EventRecorder(out_dir)
+    sm = TemporalFallDetector()
+    preview = PairedVideo(clip_path(out_dir, '_preview')) if args.save_preview else None
+    manual = None
+    log = (out_dir / 'predictions.jsonl').open('w', encoding='utf-8')
+    frozen, freeze_until = None, 0
+    target, target_seen = None, None
+    last_valid_box = None
+    last_pose_roi = None
+    last_valid_pose_t = None
+    pose_fail_since = None   # [추가] 대상 박스에서 포즈가 안 잡히기 시작한 시각
+    blocked = []             # [추가] 포즈가 안 잡혀 포기한 영역 [(box, 해제 시각)]
+    frames = alarms = 0
+    # [추가] 낙상이 확정되지 않을 때 원인을 바로 볼 수 있는 집계
+    diag = dict(frames_with_detection=0, frames_with_pose=0, frames_fall_evidence=0,
+                frames_lying=0, frames_fall_and_lying=0, longest_lying_run_sec=0.0,
+                descent_detected=0)
+    previous_state = 'standing'
+    started = time.monotonic()
+    if not args.headless:
+        cv2.namedWindow(WINDOW_NAME)
+        cv2.setMouseCallback(WINDOW_NAME, on_mouse)
+    try:
+        while True:
+            ok, original = cap.read()
+            if not ok:
+                break
+            t = time.monotonic() - started if is_camera else frames / source_fps
+            tick = time.monotonic()
+            detections = detect_people(interpreter, inputs, outputs, original)
+            blocked = [(region, until) for region, until in blocked if until > t]
+            chosen = None
+            if target is not None:
+                matches = [d for d in detections if box_iou(target, d[0]) >= TARGET_IOU]
+                if matches:
+                    chosen = max(matches, key=lambda d: box_iou(target, d[0]))
+                else:
+                    # [수정] 넘어지는 순간에는 박스가 세로→가로로 급변해 IoU가 끊긴다.
+                    # 중심이 가까우면 같은 사람으로 이어 붙여 추적을 유지한다.
+                    limit = REACQUIRE_DIST_RATIO * max(target[3] - target[1], 1)
+                    near = [d for d in detections if box_center_dist(target, d[0]) <= limit]
+                    if near:
+                        chosen = min(near, key=lambda d: box_center_dist(target, d[0]))
+                    elif t - target_seen > MAX_GAP_SEC:
+                        # [수정] 상태 기계는 초기화하지 않는다 — 초기화하면 직전 하강 이력이
+                        # 사라져 낙상이 영영 확정되지 않는다. 시간 간격 처리는 update()가 담당.
+                        target = None
+                        pose_fail_since = None
+            if target is None and detections:
+                usable = [d for d in detections if not is_blocked(d[0], blocked, t)]
+                if usable:
+                    chosen = max(usable, key=lambda d: (d[0][2]-d[0][0])*(d[0][3]-d[0][1]))
+            frame = original.copy()
+            obs = None
+            chosen_view = None   # [수정] 박스는 판정(sm.update) 뒤에 상태 색으로 그린다
+            for box, score, cid, _fall_score in detections:
+                x1, y1, x2, y2 = box
+                cv2.rectangle(frame, (x1, y1), (x2, y2), (140, 140, 140), 1)
+            pose_fallback = False
+            if (chosen is None and last_valid_box is not None and last_valid_pose_t is not None
+                    and t - last_valid_pose_t <= POSE_FALLBACK_SEC):
+                # 단기 검출 누락 때만 직전 사람 영역을 확장해 포즈 확인.
+                bx1, by1, bx2, by2 = last_valid_box
+                bw, bh = bx2 - bx1, by2 - by1
+                fh, fw = original.shape[:2]
+                search = (max(0, int(bx1-bw*.15)), max(0, int(by1-bh*.1)),
+                          min(fw, int(bx2+bw*.15)), min(fh, int(by2+bh*.4)))
+                search = last_pose_roi if last_pose_roi is not None else search
+                chosen = (search, 0.0, -1, 0.0)
+                pose_fallback = True
+            if chosen is not None:
+                box, score, cid, fall_score = chosen
+                if not pose_fallback:
+                    target, target_seen = box, t
+                x1, y1, x2, y2 = box
+                # 정상/정지 상태에서도 포즈를 추론하여 낙상 전후 관측을 유지.
+                kpts = estimate_pose(pose, pose_inputs, pose_outputs, original, *box)
+                # 검출 박스가 있어도 포즈 실패 시 최근 관절 영역으로 한 번 재확인.
+                retried_pose = False
+                if (kpts is None and not pose_fallback and last_pose_roi is not None
+                        and last_valid_pose_t is not None and t-last_valid_pose_t <= POSE_FALLBACK_SEC):
+                    kpts = estimate_pose(pose, pose_inputs, pose_outputs, original, *last_pose_roi)
+                    retried_pose = kpts is not None
+                # [추가] 대상 박스에서 사람 포즈가 계속 안 잡히면(TV·가구 등 오검출에 고착된 경우)
+                # 그 영역을 잠시 제외하고 다른 검출로 대상을 옮긴다.
+                if kpts is None and not pose_fallback:
+                    if pose_fail_since is None:
+                        pose_fail_since = t
+                    elif t - pose_fail_since > TARGET_STUCK_SEC:
+                        blocked.append((box, t + TARGET_BLOCK_SEC))
+                        target, pose_fail_since = None, None
+                else:
+                    pose_fail_since = None
+                lying, angle = None, None
+                pose_aspect = 0.0
+                hip = None
+                shoulder = None
+                if kpts is not None:
+                    # 유효 포즈가 계속 보이면 확인 영역 유지. 실패하면 기존 2초 만료 적용.
+                    last_valid_pose_t = t
+                    if not pose_fallback and not retried_pose:
+                        last_valid_box = box
+                        last_pose_roi = pose_search_box(kpts, box, original.shape)
+                    if retried_pose:
+                        pose_fallback = True
+                    visible = kpts[kpts[:, 2] >= KPT_CONF_TH]
+                    if len(visible) >= 5:
+                        pose_aspect = float(np.ptp(visible[:, 0]) / max(1.0, np.ptp(visible[:, 1])))
+                    draw_skeleton(frame, kpts)
+                    lying = is_lying_down(kpts)
+                    shoulder = _kpt_center(kpts, 'l_shoulder', 'r_shoulder')
+                    hip = _kpt_center(kpts, 'l_hip', 'r_hip')
+                    if shoulder and hip:
+                        angle = _angle_from_vertical(shoulder, hip)
+                if lying is not None:
+                    # [수정] 살아남은 박스의 클래스만 보지 않고, 겹치는 fall 박스의 점수도 근거로 인정
+                    obs = dict(cy=float(hip[1]) if hip else (y1+y2)/2,
+                               height=y2-y1, aspect=(x2-x1)/(y2-y1),
+                               shoulder_y=float(shoulder[1]) if shoulder else None,
+                               pose_aspect=pose_aspect, pose_fallback=pose_fallback,
+                               angle=angle, lying=lying,
+                               fall=bool(cid == FALL_ID or fall_score > CONF_TH))
+                chosen_view = (box, f'CNN:{CLASS_NAMES.get(cid, "pose-only")} {score:.2f} '
+                                    f'fall:{fall_score:.2f} lying:{lying}')
+            alarm = sm.update(t, obs)
+            alarms += int(alarm)
+            diag['frames_with_detection'] += int(bool(detections))
+            if obs is not None:
+                diag['frames_with_pose'] += 1
+                diag['frames_fall_evidence'] += int(obs['fall'])
+                diag['frames_lying'] += int(obs['lying'] is True)
+                diag['frames_fall_and_lying'] += int(obs['fall'] and obs['lying'] is True)
+            if sm.lying_run_since is not None:
+                diag['longest_lying_run_sec'] = round(
+                    max(diag['longest_lying_run_sec'], t - sm.lying_run_since), 2)
+            if sm.state == 'falling_candidate' and previous_state != 'falling_candidate':
+                diag['descent_detected'] += 1
+            previous_state = sm.state
+            # [수정] 판정 결과가 나온 뒤에 대상 박스를 상태 색으로 그린다
+            # (예전에는 주황 고정이라 FALLEN인데도 박스가 주황으로 나왔음)
+            color = STATE_COLOR.get(sm.state, (0, 220, 220))
+            if chosen_view is not None:
+                (bx1, by1, bx2, by2), tag = chosen_view
+                cv2.rectangle(frame, (bx1, by1), (bx2, by2), color, 2)
+                cv2.putText(frame, f'{sm.state} | {tag}', (bx1, max(18, by1-8)),
+                            cv2.FONT_HERSHEY_SIMPLEX, .45, color, 1)
+            h, w = frame.shape[:2]
+            canvas = np.zeros((h + INFO_PAD_HEIGHT, w, 3), np.uint8)
+            canvas[:h] = frame
+            fps = 1 / max(time.monotonic()-tick, 1e-6)
+            # 영상에 확정 판정, 상대 시각, 상태를 항상 포함.
+            cv2.putText(canvas, f'{sm.state.upper()}  t={t:.2f}s', (10, 27),
+                        cv2.FONT_HERSHEY_SIMPLEX, .65, color, 2)
+            draw_bar(canvas, h, w, f'{sm.state} {fps:.1f}fps',
+                     'AUTO EVENT REC' if events.active or alarm else 'AUTO READY', color, manual is not None)
+            if alarm:
+                cv2.imwrite(str(clip_path(out_dir, ext='.jpg')), canvas)
+                frozen, freeze_until = canvas.copy(), t + FREEZE_DURATION_SEC
+            # 녹화는 항상 현재 판정 화면. UI 프리즈와 추론을 분리.
+            events.update(t, canvas, original, alarm, sm.reason)
+            if preview:
+                preview.add(t, canvas, original)
+            if manual:
+                manual.add(t, canvas, original)
+            log.write(json.dumps(dict(frame=frames, time=t, state=sm.state, alarm=alarm,
+                                      observation=obs, detections=len(detections), reason=sm.reason, evidence_sec=round(sm.evidence_sec, 3),
+                                      target_box=box if chosen is not None else None)) + '\n')
+            frames += 1
+            if not args.headless:
+                display = frozen if FREEZE_ON_ALARM and frozen is not None and t < freeze_until else canvas
+                cv2.imshow(WINDOW_NAME, display)
                 toggle, quit_now = read_actions(cv2.waitKey(1) & 0xFF)
                 if toggle:
-                    rec_toggle(rec, frame_w_last, frame_h_last, rec_fps)
+                    if manual:
+                        manual.close()
+                        manual = None
+                    else:
+                        manual = PairedVideo(clip_path(out_dir, '_manual'))
+                        manual.add(t, canvas, original)
                 if quit_now:
                     break
-                continue
-            else:
-                frozen_canvas = None
-                # [수정] 프리즈 동안 프레임을 안 읽었으므로, 이전 프레임(prev_gray)이 몇 초 전 것이다.
-                # 그대로 차분하면 화면 전체가 "큰 움직임"으로 잡혀 오판하므로 기준 프레임을 새로 잡는다.
-                prev_gray = None
-                capture_cooldown_until = loop_now + CAPTURE_COOLDOWN_SEC
-                if DEBUG:
-                    print(f"[DEBUG] freeze 해제 — 실시간 모니터링 재개 "
-                          f"(재캡처 쿨다운 {CAPTURE_COOLDOWN_SEC:.1f}초)")
+            if args.max_frames and frames >= args.max_frames:
+                break
+    finally:
+        events.finish(True)
+        if manual:
+            manual.close()
+        if preview:
+            preview.close()
+        log.close()
+        cap.release()
+        if not args.headless:
+            cv2.destroyAllWindows()
+    summary = dict(frames=frames, alarms=alarms, elapsed_sec=time.monotonic()-started,
+                   event_videos=events.completed, source=args.source, model=args.model,
+                   pose_model=args.pose_model, diagnostics=diag)
+    (out_dir / 'summary.json').write_text(json.dumps(summary, indent=2), encoding='utf-8')
+    print(json.dumps(summary, indent=2))
 
-        ok, frame = cap.read()
-        if not ok:
-            break
 
-        frame_h, frame_w, _ = frame.shape
-        frame_h_last, frame_w_last = frame_h, frame_w
-
-        # [추가] clean 스트림용으로 박스·스켈레톤을 그리기 전의 원본을 따로 보관
-        raw_for_rec = frame.copy() if (rec["streams"] and rec_needs_clean()) else None
-
-        # ---- 움직임 감지를 위한 그레이스케일 변환 ----
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        gray = cv2.GaussianBlur(gray, (21, 21), 0)
-
-        # 첫 프레임인 경우 비교 대상 설정
-        if prev_gray is None:
-            prev_gray = gray
-            continue
-
-        # 현재 프레임과 이전 프레임의 차이 계산 (움직임 추출)
-        frame_diff = cv2.absdiff(prev_gray, gray)
-        prev_gray = gray.copy()  # 현재 프레임을 다음 비교를 위해 저장
-
-        # ---- 모델 전처리 ----
-        img_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        img_resized = cv2.resize(img_rgb, (IMG_SIZE, IMG_SIZE))
-
-        if input_type == np.int8 or input_type == np.uint8:
-            scale, zero_point = input_scale_zero
-            if scale != 0:
-                img_norm = img_resized.astype(np.float32) / scale + zero_point
-            else:
-                img_norm = img_resized.astype(np.float32)
-            img = img_norm.astype(input_type)
-        else:
-            img = img_resized.astype(np.float32) / 255.0
-
-        img = np.expand_dims(img, axis=0)
-        if img.shape[-1] == 3:
-            img = np.transpose(img, (0, 3, 1, 2))
-
-        interpreter.set_tensor(input_index, img)
-        interpreter.invoke()
-
-        raw = interpreter.get_tensor(output_index)
-        if raw.ndim == 3:
-            raw = raw[0]
-        if raw.shape[0] < raw.shape[1]:
-            raw = raw.transpose()
-
-        # ---- 후처리: 신뢰도 필터 + NMS ----
-        class_scores = raw[:, 4:]
-        confidences = np.max(class_scores, axis=1)
-        class_ids = np.argmax(class_scores, axis=1)
-
-        keep_mask = confidences > CONF_TH
-        filtered = raw[keep_mask]
-        scores = confidences[keep_mask]
-        classes = class_ids[keep_mask]
-
-        if len(filtered) > 0:
-            cx, cy, w, h = filtered[:, 0], filtered[:, 1], filtered[:, 2], filtered[:, 3]
-            boxes = np.stack([
-                (cx - w / 2) * IMG_SIZE,
-                (cy - h / 2) * IMG_SIZE,
-                w * IMG_SIZE,
-                h * IMG_SIZE
-            ], axis=-1)
-        else:
-            boxes = np.array([])
-
-        label = "non-fall"
-        found_fall = False
-        capture_now = False  # [추가] 이번 프레임이 "낙상 순간"으로 캡처할 프레임인지
-
-        if len(boxes) > 0:
-            keep = cv2.dnn.NMSBoxesBatched(boxes.tolist(), scores.tolist(), classes.tolist(),
-                                         score_threshold=CONF_TH, nms_threshold=IOU_TH)
-            if DEBUG:
-                print(f"[DEBUG] 이번 프레임 검출 수: {len(keep)}")
-            if len(keep) > 0:
-                scale_x = frame_w / IMG_SIZE
-                scale_y = frame_h / IMG_SIZE
-
-                for i in keep:
-                    x, y, bw, bh = boxes[i]
-
-                    x1 = int(np.clip(x * scale_x, 0, frame_w))
-                    y1 = int(np.clip(y * scale_y, 0, frame_h))
-                    x2 = int(np.clip((x + bw) * scale_x, 0, frame_w))
-                    y2 = int(np.clip((y + bh) * scale_y, 0, frame_h))
-
-                    # ---- 핵심: 바운딩 박스 내부의 '움직임 양' 검사 ----
-                    # 박스 영역 안의 픽셀 변화량 평균 계산
-                    box_diff = frame_diff[y1:y2, x1:x2]
-                    if box_diff.size > 0:
-                        mean_motion = np.mean(box_diff)
-                    else:
-                        mean_motion = 0
-
-                    current_class_id = int(classes[i])
-                    current_label = CLASS_NAMES[current_class_id]
-
-                    if DEBUG:
-                        print(f"[DEBUG] box=({x1},{y1},{x2},{y2}) motion={mean_motion:.1f} "
-                              f"label={current_label} score={scores[i]:.3f}")
-
-                    # 움직임이 임계값(MOTION_TH)보다 작으면 가만히 있는 사물(티비 등)로 판단해 무시
-                    if mean_motion < MOTION_TH:
-                        if DEBUG:
-                            print(f"[DEBUG] static 처리 (motion {mean_motion:.1f} < {MOTION_TH})")
-                        color = BOX_COLOR["static"]
-                        cv2.rectangle(frame, (x1, y1), (x2, y2), color, 1)
-                        cv2.putText(frame, f"static {scores[i]*100:.0f}%", (x1, max(y1 - 8, 12)),
-                                    cv2.FONT_HERSHEY_PLAIN, 1.0, color, 1)
-                        continue
-
-                    # [추가: 포즈] CNN이 fall로 판단한 박스에 한해서만 포즈로 한 번 더 확인
-                    # (연산 절약 — non-fall/static 박스까지 매번 포즈를 돌리지 않음)
-                    pose_lying = None
-                    if current_label == "fall":
-                        keypoints = estimate_pose(pose_interp, pose_in_d, pose_out_d,
-                                                   frame, x1, y1, x2, y2)
-                        if keypoints is not None:
-                            draw_skeleton(frame, keypoints)
-                            pose_lying = is_lying_down(keypoints)
-                            if DEBUG:
-                                print(f"[DEBUG] pose_lying={pose_lying}")
-                        elif DEBUG:
-                            print("[DEBUG] pose: 크롭에서 사람 미검출/신뢰도 부족 — CNN 판정만 사용")
-
-                    # [수정] 포즈가 한 프레임만 "안 누움"으로 튀어도 바로 취소하지 않도록,
-                    # POSE_DISAGREE_STREAK_TH 프레임 연속으로 불일치해야 실제로 취소한다.
-                    # (int8 포즈 모델이 프레임마다 흔들리는 노이즈 때문에 진짜 낙상에서도
-                    #  fallen 상태까지 못 가던 문제의 원인이었음)
-                    if pose_lying is False:
-                        pose_disagree_streak += 1
-                    elif pose_lying is True:
-                        pose_disagree_streak = 0
-                    # pose_lying이 None(크롭에서 사람 미검출 등)이면 streak를 그대로 유지
-
-                    is_fall_final = (current_label == "fall")
-                    if POSE_CONFIRM_MODE == "and" and pose_lying is not None:
-                        if pose_disagree_streak >= POSE_DISAGREE_STREAK_TH:
-                            is_fall_final = False
-                    elif POSE_CONFIRM_MODE == "or" and pose_lying:
-                        is_fall_final = True
-
-                    if DEBUG:
-                        print(f"[DEBUG] 최종 판정: is_fall_final={is_fall_final} "
-                              f"(mode={POSE_CONFIRM_MODE}, disagree_streak={pose_disagree_streak})")
-
-                    # [수정] 버그: 기존엔 is_fall_final이 False여도 current_label("fall")로
-                    # 되돌아가서 화면엔 항상 빨간 박스가 떴음 — 최종 판정을 그대로 반영하도록 수정
-                    display_label = "fall" if is_fall_final else "non-fall"
-                    color = BOX_COLOR.get(display_label, (255, 255, 0))
-                    cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-                    tag = f"{display_label} {scores[i]*100:.0f}%"
-                    if pose_lying is not None:
-                        tag += " (pose-lying)" if pose_lying else " (pose-stand)"
-                    cv2.putText(frame, tag, (x1, max(y1 - 8, 12)),
-                                cv2.FONT_HERSHEY_PLAIN, 1.2, color, 2)
-
-                    if is_fall_final:
-                        found_fall = True
-
-                    # [추가] 캡처 트리거: CNN fall + 포즈 누운 자세가 "이번 프레임에서" 동시에 성립.
-                    # pose_lying=True일 때만 트리거하므로 저장 이미지에 스켈레톤이 항상 그려져 있다.
-                    # 실제 저장/프리즈는 모든 박스를 다 그린 뒤(루프 밖)에 수행한다.
-                    if current_label == "fall" and pose_lying is True:
-                        capture_now = True
-
-                if found_fall:
-                    label = "fall"
-
-        # ---- 상태 기계 업데이트 ----
-        # [변경] sm은 이제 HUD의 상태 표시용으로만 쓴다. 캡처/프리즈는 sm과 무관하게
-        # 프레임 단위 트리거(capture_now)로 동작한다.
-        now = time.time()
-        sm.update(label, now)
-        if DEBUG:
-            print(f"[DEBUG] sm.state={sm.state} capture_now={capture_now}")
-        fps = 1.0 / max(now - prev_t, 1e-6)
-        prev_t = now
-
-        # ---- 표시용 캔버스: 프레임 아래에 검은 여백을 붙여서 정보 표시 ----
-        # (박스와 스켈레톤은 이미 frame 위에 그려져 있으므로 canvas에 그대로 포함됨)
-        canvas = np.zeros((frame_h + INFO_PAD_HEIGHT, frame_w, 3), dtype=np.uint8)
-        canvas[:frame_h, :] = frame
-
-        in_cooldown = now < capture_cooldown_until
-        do_capture = capture_now and not in_cooldown
-
-        hud_color = (0, 0, 255) if (do_capture or sm.state == "fallen") else (0, 255, 255)
-        draw_bar(canvas, frame_h, frame_w,
-                 f"state:{sm.state}  fps:{fps:.1f}",
-                 rec_line_text(rec),
-                 hud_color,
-                 bool(rec["streams"]))
-
-        if capture_now and in_cooldown and DEBUG:
-            print(f"[DEBUG] 낙상 순간 조건 충족했지만 쿨다운 중이라 캡처 생략 "
-                  f"(남은 시간 {capture_cooldown_until - now:.1f}초)")
-
-        if do_capture:
-            print(f"[CAPTURE] 낙상 순간 포착  t={now:.1f}s")
-            # [추가] 영상 위에도 표시 — 저장 이미지와 정지 화면에서 바로 보이도록
-            cv2.putText(canvas, f"FALL CAPTURED  {time.strftime('%H:%M:%S')}", (12, 34),
-                        cv2.FONT_HERSHEY_PLAIN, 1.6, (0, 0, 255), 2)
-
-            # 박스 + 스켈레톤 + 표시가 모두 그려진 화면 그대로 저장
-            if SAVE_ALARM_SNAPSHOT:
-                ts = time.strftime("%Y%m%d_%H%M%S") + f"_{int((now % 1) * 1000):03d}"
-                save_path = os.path.join(RESULT_DIR, f"fall_{ts}.jpg")
-                ok_write = cv2.imwrite(save_path, canvas)
-                print(f"[CAPTURE] 저장 {'성공' if ok_write else '실패'}: {save_path}")
-
-            # 같은 화면으로 정지
-            if FREEZE_ON_ALARM:
-                frozen_canvas = canvas.copy()
-                freeze_until = now + FREEZE_DURATION_SEC
-                if DEBUG:
-                    print(f"[DEBUG] freeze 시작 — {FREEZE_DURATION_SEC:.1f}초간 화면 고정")
-            else:
-                # 프리즈를 안 쓰는 경우에도 같은 낙상을 연속 저장하지 않도록 쿨다운 적용
-                capture_cooldown_until = now + CAPTURE_COOLDOWN_SEC
-
-        # [추가] 녹화: 박스·스켈레톤·FALL 표시가 모두 그려진 영상 영역을 기록
-        # (하단 막대는 빼고 영상 부분만 — canvas[:frame_h])
-        rec_write(rec, raw_for_rec, canvas[:frame_h])
-
-        cv2.imshow(WINDOW_NAME, canvas)
-        toggle, quit_now = read_actions(cv2.waitKey(1) & 0xFF)
-        if toggle:
-            rec_toggle(rec, frame_w, frame_h, rec_fps)
-        if quit_now:
-            break
-
-    rec_stop(rec)   # [추가] 녹화 중 종료해도 저장되도록
-    cap.release()
-    cv2.destroyAllWindows()
-
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
