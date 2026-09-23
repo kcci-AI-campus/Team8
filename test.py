@@ -27,8 +27,9 @@ ultralytics 설치가 필요 없습니다 — 이미 검증된 환경(tflite_run
   [START REC] / [STOP & SAVE] 버튼 클릭  또는  r · 스페이스 키 → 녹화 시작 / 종료(자동 저장)
   [QUIT] 버튼 클릭 또는 q 키                                    → 종료 (녹화 중이면 저장하고 종료)
 저장 위치: clips/clip_날짜_시각.avi
-  RECORD_MODE 로 저장 내용을 고릅니다 — "overlay"(박스·스켈레톤·FALL 표시 포함, 기본),
-  "clean"(표시 없는 원본, 다른 구조와 비교 실험용), "both"(두 파일 동시 저장).
+  기본(RECORD_MODE="both")은 한 번 녹화에 두 파일이 만들어집니다.
+    clip_날짜_시각.avi       — 캠 영상 + 판정 결과(박스·스켈레톤·FALL 표시)
+    clip_날짜_시각_raw.avi   — 표시 없는 순수 캠 영상 (다른 방식으로 다시 실험할 때 사용)
   재생 길이는 실제 촬영 시간과 같게 맞춰집니다 (처리 속도가 변해도 구간별로 배속되지 않음).
 """
 import time
@@ -39,7 +40,7 @@ import tflite_runtime.interpreter as tflite
 from state_machine import FallStateMachine
 
 # ---- 설정 -------------------------------------------------
-MODEL_PATH = "best_Hfall_int8.tflite"
+MODEL_PATH = "best_int8.tflite"
 IMG_SIZE = 320
 CONF_TH = 0.45                    # 신뢰도 임계값
 IOU_TH = 0.45
@@ -53,9 +54,11 @@ WINDOW_NAME = "fall detection"
 CLIP_DIR = "clips"                # 녹화 파일 저장 폴더 (없으면 자동 생성)
 REC_FOURCC = "MJPG"               # 라즈베리파이에서 가장 무난한 조합 (MJPG + .avi)
 REC_EXT = ".avi"                  # mp4로 받고 싶으면 REC_FOURCC="mp4v", REC_EXT=".mp4"
-RECORD_MODE = "overlay"           # "overlay": 박스·스켈레톤·판정 표시가 그려진 화면 저장 (기본)
-                                   # "clean"  : 표시 없는 원본 저장 (다른 구조에 넣어 비교 실험용)
-                                   # "both"   : 두 파일 동시 저장 (clip_....avi + clip_..._raw.avi)
+RECORD_MODE = "both"              # "both"   : 두 파일 동시 저장 (기본)
+                                   #            clip_....avi      = 캠 영상 + 판정 결과(박스·스켈레톤·FALL)
+                                   #            clip_..._raw.avi  = 표시 없는 순수 캠 영상 (다른 방식 실험용)
+                                   # "overlay": 판정 결과가 그려진 화면만 저장
+                                   # "clean"  : 순수 캠 영상만 저장 (이때는 파일명에 _raw를 붙이지 않음)
 REC_TARGET_FPS = 0                # 저장 파일의 fps. 0이면 자동(카메라 측정값과 REC_FPS_CAP 중 작은 값)
 REC_FPS_CAP = 15                  # 자동일 때의 상한 — 높을수록 파일이 커짐
 REC_WARMUP_FRAMES = 20            # 카메라 속도 측정에 쓸 프레임 수
